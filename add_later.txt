@@ -1,0 +1,4 @@
+ui
+GITHUB_TOKEN
+openaikey or other key
+use local model - should install ollama and select specific model and use it
