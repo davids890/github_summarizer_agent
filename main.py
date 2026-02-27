@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
 
-from repo_service import process_repo, parse_github_url
+from repo_service import process_repo, parse_github_url  # noqa: F401
 
 load_dotenv()
 
@@ -22,8 +22,7 @@ app.add_middleware(
 
 class SummarizeRequest(BaseModel):
     url: HttpUrl
-    priority: str = "all"  # "all", "high", "high+medium"
-    api_key: str | None = None  # user's OpenAI API key (optional, falls back to .env)
+    api_key: str | None = None
 
 
 class SummarizeResponse(BaseModel):
@@ -40,11 +39,8 @@ def summarize(request: SummarizeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    if request.priority not in ("all", "high", "high+medium"):
-        raise HTTPException(status_code=400, detail="priority must be 'all', 'high', or 'high+medium'")
-
     try:
-        summary = process_repo(url, priority=request.priority, api_key=request.api_key)
+        summary = process_repo(url, api_key=request.api_key)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process repo: {e}")
 

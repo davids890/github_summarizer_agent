@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -12,7 +13,7 @@ from openai import OpenAI
 SKIP_DIRS = {
     "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
     "dist", "build", ".next", ".nuxt", "vendor", ".tox", ".mypy_cache",
-    ".pytest_cache", "coverage", ".idea", ".vscode", "docs", ".github",
+    ".pytest_cache", "coverage", ".idea", ".vscode",
 }
 
 SKIP_EXTENSIONS = {
@@ -25,40 +26,63 @@ SKIP_EXTENSIONS = {
     ".DS_Store", ".gitignore",
 }
 
-HIGH_PRIORITY_NAMES = {
-    "README.md", "readme.md", "README.rst",
-    "main.py", "app.py", "index.py", "server.py", "cli.py",
-    "index.ts", "index.js", "app.ts", "app.js", "main.ts", "main.js",
-    "setup.py", "setup.cfg", "pyproject.toml",
-    "package.json", "Cargo.toml", "go.mod",
-    "Makefile", "Dockerfile", "docker-compose.yml",
-    "requirements.txt",
-}
-
-LOW_PRIORITY_DIRS = {
-    "test", "tests", "spec", "specs", "examples", "example",
-    "docs_src", "benchmarks", "scripts",
-}
-
 MAX_FILE_SIZE = 100_000
-MAX_TOTAL_CHARS = 500_000
-MAX_FILES = 150
 MAX_CONTEXT_TOKENS = 100_000
 
-SYSTEM_PROMPT = """You are a code analyst. Given a repository's directory structure and file contents, produce a clear, human-readable summary.
+_enc = tiktoken.encoding_for_model("gpt-4o")
+
+
+def _count_tokens(text: str) -> int:
+    return len(_enc.encode(text))
+
+
+# ── Prompts ──────────────────────────────────────────────────────────────
+
+SELECTOR_PROMPT = """\
+You are a repository analyst. You will receive the full directory tree of a \
+codebase. Your job is to select the **up to 20 most important files** that \
+would give someone the best understanding of the project.
+
+Prioritize (in rough order):
+- README / docs at the root
+- Entry points (main.py, index.ts, app.py, etc.)
+- Core business-logic / domain modules
+- Configuration files that reveal the stack (package.json, pyproject.toml, \
+Cargo.toml, Dockerfile, etc.)
+- API route definitions
+- Key data models / schemas
+
+Avoid:
+- Test files (unless the project IS a test framework)
+- Generated / config-only files (tsconfig, eslint, .prettierrc, etc.)
+- Lock files, CI configs, changelogs
+
+Return **only** a JSON object with a single key "files" whose value is an \
+array of relative file paths, ordered from MOST important to LEAST important. \
+No explanation, no markdown fences — just the raw JSON object.
+
+Example:
+{"files": ["README.md", "src/main.py", "src/core/engine.py"]}
+"""
+
+SUMMARIZE_PROMPT = """\
+You are a code analyst. Given a repository's directory structure and selected \
+file contents, produce a clear, human-readable summary.
 
 Your summary should include these sections:
 1. **Purpose** — What does this project do? (1-2 sentences)
 2. **Tech Stack** — Languages, frameworks, and key dependencies
 3. **Architecture** — How is the codebase organized? Key modules/packages
 4. **Key Components** — The most important files/classes/functions and what they do
-5. **Getting Started** — How to install and run the project (if discernible from the code)
+5. **Getting Started** — How to install and run the project (if discernible)
 
-Keep the summary concise but informative. Focus on what matters most to someone seeing this project for the first time.
-Do NOT include a title or heading like "Repository Summary" at the top. Start directly with the content."""
+Keep it concise but informative. Focus on what matters most to someone seeing \
+this project for the first time.
+Do NOT include a title or heading like "Repository Summary" at the top. \
+Start directly with the content."""
 
 
-# --- Step 1: Parse GitHub URL ---
+# ── Step 1: Parse GitHub URL ─────────────────────────────────────────────
 
 def parse_github_url(url: str) -> tuple[str, str]:
     """Extract owner and repo name from a GitHub URL."""
@@ -81,7 +105,7 @@ def parse_github_url(url: str) -> tuple[str, str]:
     return owner, repo
 
 
-# --- Step 2: Clone the Repository ---
+# ── Step 2: Clone the Repository ─────────────────────────────────────────
 
 def clone_repo(owner: str, repo: str) -> Path:
     """Shallow-clone a GitHub repo into a temp directory."""
@@ -97,39 +121,11 @@ def clone_repo(owner: str, repo: str) -> Path:
     return tmp_dir
 
 
-# --- Step 3: Filter Relevant Files ---
+# ── Step 3: Collect all eligible file paths ──────────────────────────────
 
-def _prioritize_files(
-    files: list[Path], repo_path: Path
-) -> tuple[list[Path], list[Path], list[Path]]:
-    """Sort files into priority tiers. Returns (high, medium, low)."""
-    high, medium, low = [], [], []
-
-    for f in files:
-        rel = f.relative_to(repo_path)
-        parts = set(rel.parts)
-
-        if rel.name in HIGH_PRIORITY_NAMES:
-            high.append(f)
-        elif parts & LOW_PRIORITY_DIRS:
-            low.append(f)
-        else:
-            medium.append(f)
-
-    key = lambda f: (len(f.relative_to(repo_path).parts), str(f))
-    high.sort(key=key)
-    medium.sort(key=key)
-    low.sort(key=key)
-
-    return high, medium, low
-
-
-def filter_files(repo_path: Path, priority: str = "all") -> list[Path]:
-    """Walk the cloned repo, filter, and return priority-sorted file paths.
-
-    priority: "all" (default), "high", "high+medium"
-    """
-    filtered = []
+def collect_files(repo_path: Path) -> list[Path]:
+    """Walk the repo, skip noise dirs/extensions, return all eligible files."""
+    result = []
 
     for root, dirs, files in os.walk(repo_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
@@ -139,27 +135,20 @@ def filter_files(repo_path: Path, priority: str = "all") -> list[Path]:
 
             if any(filename.endswith(ext) for ext in SKIP_EXTENSIONS):
                 continue
-
             try:
                 if filepath.stat().st_size > MAX_FILE_SIZE:
                     continue
             except OSError:
                 continue
 
-            filtered.append(filepath)
+            result.append(filepath)
 
-    high, medium, low = _prioritize_files(filtered, repo_path)
-
-    if priority == "high":
-        return high
-    elif priority == "high+medium":
-        return high + medium
-    return high + medium + low
+    return sorted(result, key=lambda f: str(f.relative_to(repo_path)))
 
 
-# --- Step 4: Read File Contents ---
+# ── Step 4: Build directory tree string ──────────────────────────────────
 
-def _build_directory_tree(repo_path: Path, files: list[Path]) -> str:
+def build_directory_tree(repo_path: Path, files: list[Path]) -> str:
     """Build a text representation of the directory structure."""
     lines = ["# Directory Structure", "```"]
     seen_dirs: set[Path] = set()
@@ -179,17 +168,41 @@ def _build_directory_tree(repo_path: Path, files: list[Path]) -> str:
     return "\n".join(lines)
 
 
-_enc = tiktoken.encoding_for_model("gpt-4o")
+# ── Step 5: LLM Selector Agent ──────────────────────────────────────────
 
-FULL_READ_NAMES = {
-    "README.md", "readme.md", "README.rst",
-    "main.py", "app.py", "index.py",
-}
+def select_important_files(
+    tree: str, all_files: list[Path], repo_path: Path,
+    api_key: str | None = None,
+) -> list[Path]:
+    """Ask GPT-4o to pick up to 20 most important files from the tree."""
+    client = OpenAI(api_key=api_key) if api_key else OpenAI()
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": SELECTOR_PROMPT},
+            {"role": "user", "content": tree},
+        ],
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+
+    raw = response.choices[0].message.content
+    selected_paths: list[str] = json.loads(raw).get("files", [])
+
+    rel_to_abs = {str(f.relative_to(repo_path)): f for f in all_files}
+
+    ordered: list[Path] = []
+    for rel in selected_paths:
+        if rel in rel_to_abs and rel_to_abs[rel] not in ordered:
+            ordered.append(rel_to_abs[rel])
+        if len(ordered) >= 20:
+            break
+
+    return ordered
 
 
-def _count_tokens(text: str) -> int:
-    return len(_enc.encode(text))
-
+# ── Step 6: Build context within token budget ────────────────────────────
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     """Truncate text to fit within max_tokens, cutting at a line boundary."""
@@ -203,69 +216,42 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return truncated + "\n\n... [truncated] ..."
 
 
-def read_all_contents(repo_path: Path, files: list[Path]) -> str:
-    """Build directory tree + read filtered files into a context string.
+def build_context(
+    repo_path: Path, tree: str, important_files: list[Path],
+) -> str:
+    """Assemble tree + file contents, trimming least-important files first
+    so total context stays under MAX_CONTEXT_TOKENS."""
 
-    High-priority files (README, main entry points) are included in full.
-    Remaining files share the leftover token budget equally, each truncated
-    to its fair share so every file gets represented.
-    """
-    tree = _build_directory_tree(repo_path, files)
-
-    system_tokens = _count_tokens(SYSTEM_PROMPT)
+    system_tokens = _count_tokens(SUMMARIZE_PROMPT)
     token_budget = MAX_CONTEXT_TOKENS - system_tokens
-    total_tokens = _count_tokens(tree)
+    tree_tokens = _count_tokens(tree)
 
-    files_to_read = files[:MAX_FILES]
-
-    full_read_files: list[tuple[Path, str]] = []
-    trimmable_files: list[tuple[Path, str]] = []
-
-    for filepath in files_to_read:
+    file_chunks: list[tuple[str, int]] = []
+    for filepath in important_files:
         try:
             content = filepath.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
+        rel = filepath.relative_to(repo_path)
+        chunk = f"## File: {rel}\n```\n{content}\n```"
+        file_chunks.append((chunk, _count_tokens(chunk)))
 
-        if filepath.name in FULL_READ_NAMES:
-            full_read_files.append((filepath, content))
-        else:
-            trimmable_files.append((filepath, content))
+    total = tree_tokens + sum(t for _, t in file_chunks)
 
-    context_parts = []
+    while total > token_budget and file_chunks:
+        removed_chunk, removed_tokens = file_chunks.pop()
+        total -= removed_tokens
 
-    for filepath, content in full_read_files:
-        rel_path = filepath.relative_to(repo_path)
-        chunk = f"## File: {rel_path}\n```\n{content}\n```"
-        chunk_tokens = _count_tokens(chunk)
-        total_tokens += chunk_tokens
-        context_parts.append(chunk)
+    parts = [tree] + [chunk for chunk, _ in file_chunks]
+    context = "\n\n".join(parts)
 
-    remaining_budget = token_budget - total_tokens
-    if trimmable_files and remaining_budget > 0:
-        per_file_budget = remaining_budget // len(trimmable_files)
-        per_file_budget = max(per_file_budget, 50)
+    if _count_tokens(context) + system_tokens > MAX_CONTEXT_TOKENS:
+        context = _truncate_to_tokens(context, token_budget)
 
-        for filepath, content in trimmable_files:
-            rel_path = filepath.relative_to(repo_path)
-            chunk = f"## File: {rel_path}\n```\n{content}\n```"
-            chunk_tokens = _count_tokens(chunk)
-
-            if chunk_tokens > per_file_budget:
-                content = _truncate_to_tokens(content, per_file_budget - 20)
-                chunk = f"## File: {rel_path}\n```\n{content}\n```"
-                chunk_tokens = _count_tokens(chunk)
-
-            if total_tokens + chunk_tokens > token_budget:
-                break
-
-            context_parts.append(chunk)
-            total_tokens += chunk_tokens
-
-    return tree + "\n\n" + "\n\n".join(context_parts)
+    return context
 
 
-# --- Step 5: Summarize with LLM ---
+# ── Step 7: Summarize with LLM ──────────────────────────────────────────
 
 def summarize_repo(context: str, api_key: str | None = None) -> str:
     """Send repo context to the LLM and return a summary."""
@@ -273,7 +259,7 @@ def summarize_repo(context: str, api_key: str | None = None) -> str:
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": SUMMARIZE_PROMPT},
             {"role": "user", "content": f"Summarize this repository:\n\n{context}"},
         ],
         temperature=0.3,
@@ -281,17 +267,19 @@ def summarize_repo(context: str, api_key: str | None = None) -> str:
     return response.choices[0].message.content
 
 
-# --- Full Pipeline ---
+# ── Full Pipeline ────────────────────────────────────────────────────────
 
-def process_repo(url: str, priority: str = "all", api_key: str | None = None) -> str:
-    """End-to-end: URL → clone → filter → read → summarize → cleanup."""
+def process_repo(url: str, api_key: str | None = None) -> str:
+    """End-to-end: URL → clone → tree → select → read → summarize → cleanup."""
     owner, repo = parse_github_url(url)
     repo_path = clone_repo(owner, repo)
 
     try:
-        files = filter_files(repo_path, priority=priority)
-        context = read_all_contents(repo_path, files)
-        summary = summarize_repo(context, api_key=api_key)
+        all_files = collect_files(repo_path)
+        tree = build_directory_tree(repo_path, all_files)
+        important = select_important_files(tree, all_files, repo_path, api_key)
+        context = build_context(repo_path, tree, important)
+        summary = summarize_repo(context, api_key)
     finally:
         shutil.rmtree(repo_path, ignore_errors=True)
 
