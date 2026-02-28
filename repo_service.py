@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -282,6 +283,65 @@ def summarize_repo(context: str, api_key: str | None = None) -> str:
     return response.choices[0].message.content
 
 
+# --- Step 6: LLM-based File Selection Agent ---
+
+SELECT_FILES_PROMPT = """You are a code-repository analyst. You will receive a list of file paths from a GitHub repository.
+
+Your task: select up to 20 files that are **most important** for understanding the project. Prioritize:
+1. README and documentation entry points
+2. Main entry points (main.py, app.py, index.ts, etc.)
+3. Core business logic / domain modules
+4. Configuration & dependency manifests (package.json, pyproject.toml, etc.)
+5. API route definitions or CLI handlers
+6. Key model/schema definitions
+
+Avoid selecting:
+- Test files (unless they are the only way to understand the API)
+- Generated or boilerplate files
+- Assets, configs for linters/CI, or lockfiles
+
+Return ONLY a JSON array of the selected file paths (as strings), nothing else.
+Example: ["README.md", "src/main.py", "src/models.py"]"""
+
+
+def select_important_files(
+    repo_path: Path,
+    files: list[Path],
+    api_key: str | None = None,
+    max_files: int = 20,
+) -> list[Path]:
+    """Use an LLM to pick the most important files (up to *max_files*) from the repo."""
+    if len(files) <= max_files:
+        return files
+
+    rel_paths = [str(f.relative_to(repo_path)) for f in files]
+    file_list_text = "\n".join(rel_paths)
+
+    client = OpenAI(api_key=api_key) if api_key else OpenAI()
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": SELECT_FILES_PROMPT},
+            {"role": "user", "content": file_list_text},
+        ],
+        temperature=0,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        selected: list[str] = json.loads(raw)
+    except json.JSONDecodeError:
+        return files[:max_files]
+
+    rel_to_abs = {str(f.relative_to(repo_path)): f for f in files}
+    result = [rel_to_abs[p] for p in selected if p in rel_to_abs]
+
+    return result or files[:max_files]
+
+
 # --- Full Pipeline ---
 
 def process_repo(url: str, priority: str = "all", api_key: str | None = None) -> str:
@@ -291,7 +351,8 @@ def process_repo(url: str, priority: str = "all", api_key: str | None = None) ->
 
     try:
         files = filter_files(repo_path, priority=priority)
-        context = read_all_contents(repo_path, files)
+        important_files = select_important_files(repo_path, files, api_key=api_key)
+        context = read_all_contents(repo_path, important_files)
         summary = summarize_repo(context, api_key=api_key)
     finally:
         shutil.rmtree(repo_path, ignore_errors=True)

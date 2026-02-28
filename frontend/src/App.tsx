@@ -94,7 +94,7 @@ className="w-full h-[60px] rounded-[16px] border border-[#e0e0e0] bg-[#fafafa] f
               {/* API Key Input */}
               <div className="flex flex-col gap-3">
                 <label className="font-['Roboto_Mono'] text-[14px] text-[#485c11] tracking-[-0.12px] leading-[1.4] font-medium">
-                  OpenAI API Key (model: gpt-5-nano-2025-08-07)
+                  OpenAI API Key (model: gpt-4o)
                 </label>
                 <input
                   type="password"
