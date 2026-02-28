@@ -1,6 +1,9 @@
 # GitHub Repository Summarizer
 
 A full-stack app that takes a GitHub repository URL and returns a structured, AI-generated summary — covering purpose, tech stack, architecture, key components, and setup instructions.
+![Demo](images/1.png)
+![Demo](images/2.png)
+![Demo](images/3.png)
 
 Users can bring their own OpenAI API key or fall back to a server-side key.
 
